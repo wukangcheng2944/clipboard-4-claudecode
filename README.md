@@ -29,7 +29,7 @@
 
 1. 克隆仓库：
    ```bash
-   git clone git@github.com:wukangcheng2944/clipboard4cc.git
+   git clone git@github.com:Osipov4/clipboard-4-claudecode.git
    ```
 
 2. 修改配置（可选）：
