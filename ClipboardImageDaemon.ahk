@@ -8,6 +8,8 @@
 
 ; 配置
 global ImageSavePath := "F:\workspace\image"
+global WSLImageSavePath := "\\wsl$\Ubuntu\home\kangcheng\screenshot"  ; WSL Ubuntu 下的保存路径
+global WSLLinuxPath := "/home/kangcheng/screenshot"  ; 对应的 Linux 路径（用于粘贴）
 global IsProcessing := false
 global LastSaveTime := 0
 global LastClipboardBitmap := 0  ; 保存最后一次检测到的图片剪贴板状态
@@ -32,9 +34,20 @@ global TerminalProcesses := [
     "Code.exe"  ; VS Code 的终端
 ]
 
+; WSL 相关进程列表
+global WSLProcesses := [
+    "wsl.exe",
+    "wslhost.exe",
+    "ubuntu.exe",
+    "debian.exe",
+    "kali.exe"
+]
+
 ; 确保保存目录存在
 if !DirExist(ImageSavePath)
     DirCreate(ImageSavePath)
+if !DirExist(WSLImageSavePath)
+    try DirCreate(WSLImageSavePath)  ; WSL 目录可能不可用，忽略错误
 
 ; 加载 GDI+
 global pToken := 0
@@ -49,6 +62,7 @@ OnClipboardChange(ClipboardChanged)
 ; 注册 Ctrl+V 热键来拦截终端中的粘贴
 #HotIf IsTerminalActive()
 ^v::HandleTerminalPaste()
+RButton::HandleTerminalRightClick()
 #HotIf
 
 ; 退出时清理
@@ -64,10 +78,40 @@ A_IconTip := "剪贴板图片守护进程"
 ; 启动提示
 TrayTip("剪贴板图片守护进程", "已启动，监控剪贴板中的图片...")
 
+; 启动时清理一次旧文件
+CleanOldImages()
+
+; 每天清理一次旧文件（24小时 = 86400000毫秒）
+SetTimer(CleanOldImages, 86400000)
+
 ExitFunc(*) {
     global pToken
     if pToken
         DllCall("gdiplus\GdiplusShutdown", "Ptr", pToken)
+}
+
+; 清理7天前的旧图片文件
+CleanOldImages() {
+    global ImageSavePath, WSLImageSavePath
+
+    sevenDaysAgo := DateAdd(A_Now, -7, "Days")
+
+    ; 清理 Windows 目录
+    CleanOldImagesInDir(ImageSavePath, sevenDaysAgo)
+
+    ; 清理 WSL 目录
+    try CleanOldImagesInDir(WSLImageSavePath, sevenDaysAgo)
+}
+
+CleanOldImagesInDir(dirPath, beforeDate) {
+    if !DirExist(dirPath)
+        return
+
+    loop files dirPath . "\clip_*.jpg" {
+        if (A_LoopFileTimeCreated < beforeDate) {
+            try FileDelete(A_LoopFileFullPath)
+        }
+    }
 }
 
 ; 主函数：处理剪贴板变化（只记录是否有图片）
@@ -102,9 +146,31 @@ IsTerminalActive() {
     return false
 }
 
+; 检测当前是否在 WSL 终端中（通过窗口标题判断）
+IsWSLTerminal() {
+    global WSLProcesses
+
+    try {
+        processName := WinGetProcessName("A")
+        ; 直接运行 WSL 进程
+        for wslProc in WSLProcesses {
+            if (processName = wslProc)
+                return true
+        }
+        ; Windows Terminal 中运行 WSL（检查窗口标题，不区分大小写）
+        if (processName = "WindowsTerminal.exe") {
+            title := WinGetTitle("A")
+            titleLower := StrLower(title)
+            if InStr(titleLower, "ubuntu") || InStr(titleLower, "wsl") || InStr(titleLower, "debian") || InStr(titleLower, "kali")
+                return true
+        }
+    }
+    return false
+}
+
 ; 处理终端中的粘贴操作
 HandleTerminalPaste() {
-    global LastClipboardBitmap, IsProcessing, LastSaveTime
+    global LastClipboardBitmap, IsProcessing, LastSaveTime, ImageSavePath, WSLImageSavePath, WSLLinuxPath
 
     ; 如果剪贴板没有图片，执行正常粘贴
     if !LastClipboardBitmap {
@@ -125,14 +191,25 @@ HandleTerminalPaste() {
     IsProcessing := true
 
     try {
+        ; 检测是否在 WSL 终端中
+        isWSL := IsWSLTerminal()
+
         ; 生成文件名（使用时间戳+毫秒）
         timestamp := FormatTime(, "yyyyMMdd_HHmmss")
         ms := Mod(A_TickCount, 1000)
         fileName := "clip_" . timestamp . "_" . ms . ".jpg"
-        filePath := ImageSavePath . "\" . fileName
+
+        ; 根据终端类型选择保存路径
+        if isWSL {
+            savePath := WSLImageSavePath . "\" . fileName
+            clipboardPath := WSLLinuxPath . "/" . fileName  ; Linux 风格路径
+        } else {
+            savePath := ImageSavePath . "\" . fileName
+            clipboardPath := savePath
+        }
 
         ; 保存图片
-        if SaveBitmapFromClipboard(filePath) {
+        if SaveBitmapFromClipboard(savePath) {
             LastSaveTime := A_TickCount
             LastClipboardBitmap := false
 
@@ -142,12 +219,12 @@ HandleTerminalPaste() {
             ; 设置剪贴板为路径
             A_Clipboard := ""
             Sleep(50)
-            A_Clipboard := filePath
+            A_Clipboard := clipboardPath
 
             if ClipWait(2, 0) {
                 ; 执行粘贴
                 Send("^v")
-                TrayTip("图片已保存", fileName)
+                TrayTip("图片已保存", fileName . (isWSL ? " (WSL)" : ""))
             } else {
                 TrayTip("错误", "设置剪贴板失败")
             }
@@ -157,6 +234,80 @@ HandleTerminalPaste() {
         } else {
             ; 保存失败，执行正常粘贴
             Send("^v")
+        }
+    }
+
+    IsProcessing := false
+}
+
+; 处理终端中的右键点击（粘贴）
+HandleTerminalRightClick() {
+    global LastClipboardBitmap, IsProcessing, LastSaveTime, ImageSavePath, WSLImageSavePath, WSLLinuxPath
+
+    ; 如果剪贴板没有图片，执行正常右键
+    if !LastClipboardBitmap {
+        Click("Right")
+        return
+    }
+
+    ; 避免重入和频繁触发
+    if IsProcessing {
+        Click("Right")
+        return
+    }
+
+    currentTime := A_TickCount
+    if (currentTime - LastSaveTime < 500) {
+        Click("Right")
+        return
+    }
+
+    IsProcessing := true
+
+    try {
+        ; 检测是否在 WSL 终端中
+        isWSL := IsWSLTerminal()
+
+        ; 生成文件名（使用时间戳+毫秒）
+        timestamp := FormatTime(, "yyyyMMdd_HHmmss")
+        ms := Mod(A_TickCount, 1000)
+        fileName := "clip_" . timestamp . "_" . ms . ".jpg"
+
+        ; 根据终端类型选择保存路径
+        if isWSL {
+            savePath := WSLImageSavePath . "\" . fileName
+            clipboardPath := WSLLinuxPath . "/" . fileName  ; Linux 风格路径
+        } else {
+            savePath := ImageSavePath . "\" . fileName
+            clipboardPath := savePath
+        }
+
+        ; 保存图片
+        if SaveBitmapFromClipboard(savePath) {
+            LastSaveTime := A_TickCount
+            LastClipboardBitmap := false
+
+            ; 临时移除监听
+            OnClipboardChange(ClipboardChanged, 0)
+
+            ; 设置剪贴板为路径
+            A_Clipboard := ""
+            Sleep(50)
+            A_Clipboard := clipboardPath
+
+            if ClipWait(2, 0) {
+                ; 执行右键粘贴
+                Click("Right")
+                TrayTip("图片已保存", fileName . (isWSL ? " (WSL)" : ""))
+            } else {
+                TrayTip("错误", "设置剪贴板失败")
+            }
+
+            ; 延迟恢复监听
+            SetTimer(EnableClipboardMonitor, -300)
+        } else {
+            ; 保存失败，执行正常右键
+            Click("Right")
         }
     }
 
