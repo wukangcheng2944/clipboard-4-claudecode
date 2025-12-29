@@ -10,6 +10,27 @@
 global ImageSavePath := "F:\workspace\image"
 global IsProcessing := false
 global LastSaveTime := 0
+global LastClipboardBitmap := 0  ; 保存最后一次检测到的图片剪贴板状态
+
+; 终端程序列表（可根据需要添加）
+global TerminalProcesses := [
+    "WindowsTerminal.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "ConEmu64.exe",
+    "ConEmu.exe",
+    "mintty.exe",
+    "Hyper.exe",
+    "Alacritty.exe",
+    "wezterm-gui.exe",
+    "wsl.exe",
+    "wslhost.exe",
+    "ubuntu.exe",
+    "debian.exe",
+    "kali.exe",
+    "Code.exe"  ; VS Code 的终端
+]
 
 ; 确保保存目录存在
 if !DirExist(ImageSavePath)
@@ -24,6 +45,11 @@ DllCall("gdiplus\GdiplusStartup", "Ptr*", &pToken, "Ptr", si, "Ptr", 0)
 
 ; 注册剪贴板变化监听
 OnClipboardChange(ClipboardChanged)
+
+; 注册 Ctrl+V 热键来拦截终端中的粘贴
+#HotIf IsTerminalActive()
+^v::HandleTerminalPaste()
+#HotIf
 
 ; 退出时清理
 OnExit(ExitFunc)
@@ -44,28 +70,57 @@ ExitFunc(*) {
         DllCall("gdiplus\GdiplusShutdown", "Ptr", pToken)
 }
 
-; 主函数：处理剪贴板变化
+; 主函数：处理剪贴板变化（只记录是否有图片）
 ClipboardChanged(DataType) {
-    global IsProcessing, LastSaveTime
+    global LastClipboardBitmap
+
+    ; DataType: 0=空, 1=文本/文件, 2=其他格式(如图片)
+    if (DataType = 2) {
+        ; 检查是否有位图格式
+        CF_BITMAP := 2
+        CF_DIB := 8
+        if DllCall("IsClipboardFormatAvailable", "UInt", CF_BITMAP)
+            || DllCall("IsClipboardFormatAvailable", "UInt", CF_DIB) {
+            LastClipboardBitmap := true
+            return
+        }
+    }
+    LastClipboardBitmap := false
+}
+
+; 检测当前活动窗口是否为终端
+IsTerminalActive() {
+    global TerminalProcesses
+
+    try {
+        processName := WinGetProcessName("A")
+        for terminal in TerminalProcesses {
+            if (processName = terminal)
+                return true
+        }
+    }
+    return false
+}
+
+; 处理终端中的粘贴操作
+HandleTerminalPaste() {
+    global LastClipboardBitmap, IsProcessing, LastSaveTime
+
+    ; 如果剪贴板没有图片，执行正常粘贴
+    if !LastClipboardBitmap {
+        Send("^v")
+        return
+    }
 
     ; 避免重入和频繁触发
     if IsProcessing
         return
 
     currentTime := A_TickCount
-    if (currentTime - LastSaveTime < 500)
+    if (currentTime - LastSaveTime < 500) {
+        Send("^v")
         return
-
-    ; DataType: 0=空, 1=文本/文件, 2=其他格式(如图片)
-    if (DataType != 2)
-        return
-
-    ; 检查是否有位图格式
-    CF_BITMAP := 2
-    CF_DIB := 8
-    if !DllCall("IsClipboardFormatAvailable", "UInt", CF_BITMAP)
-        && !DllCall("IsClipboardFormatAvailable", "UInt", CF_DIB)
-        return
+    }
 
     IsProcessing := true
 
@@ -79,39 +134,40 @@ ClipboardChanged(DataType) {
         ; 保存图片
         if SaveBitmapFromClipboard(filePath) {
             LastSaveTime := A_TickCount
-            ; 延迟设置剪贴板路径
-            SetTimer(SetClipPath.Bind(filePath), -150)
-            TrayTip("图片已保存", fileName)
+            LastClipboardBitmap := false
+
+            ; 临时移除监听
+            OnClipboardChange(ClipboardChanged, 0)
+
+            ; 设置剪贴板为路径
+            A_Clipboard := ""
+            Sleep(50)
+            A_Clipboard := filePath
+
+            if ClipWait(2, 0) {
+                ; 执行粘贴
+                Send("^v")
+                TrayTip("图片已保存", fileName)
+            } else {
+                TrayTip("错误", "设置剪贴板失败")
+            }
+
+            ; 延迟恢复监听
+            SetTimer(EnableClipboardMonitor, -300)
+        } else {
+            ; 保存失败，执行正常粘贴
+            Send("^v")
         }
     }
 
     IsProcessing := false
 }
 
-; 设置剪贴板路径
-SetClipPath(filePath) {
-    ; 临时移除监听
-    OnClipboardChange(ClipboardChanged, 0)
-
-    ; 清空并设置文本
-    A_Clipboard := ""
-    Sleep(50)
-    A_Clipboard := filePath
-
-    ; 等待剪贴板准备好
-    if !ClipWait(2, 0) {
-        TrayTip("错误", "设置剪贴板失败")
-    }
-
-    ; 延迟恢复监听
-    SetTimer(EnableClipboardMonitor, -300)
-}
-
 EnableClipboardMonitor() {
     OnClipboardChange(ClipboardChanged)
 }
 
-; 从剪贴板保存位图为 PNG
+; 从剪贴板保存位图为 JPG
 SaveBitmapFromClipboard(filePath) {
     global pToken
 
