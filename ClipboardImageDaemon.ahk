@@ -3,18 +3,16 @@
 
 ; ============================================================
 ; 剪贴板图片守护进程
-; 功能：检测剪贴板中的图片，保存到指定目录，并将路径复制到剪贴板
+; 功能：在终端中粘贴图片时自动转换为文件路径，其他应用正常粘贴图片
 ; ============================================================
 
 ; 配置
 global ImageSavePath := "F:\workspace\image"
-global WSLImageSavePath := "\\wsl$\Ubuntu\home\kangcheng\screenshot"  ; WSL Ubuntu 下的保存路径
-global WSLLinuxPath := "/home/kangcheng/screenshot"  ; 对应的 Linux 路径（用于粘贴）
+global WSLImageSavePath := "\\wsl$\Ubuntu\home\kangcheng\screenshot"
+global WSLLinuxPath := "/home/kangcheng/screenshot"
 global IsProcessing := false
-global LastSaveTime := 0
-global LastClipboardBitmap := 0  ; 保存最后一次检测到的图片剪贴板状态
 
-; 终端程序列表（可根据需要添加）
+; 终端程序列表
 global TerminalProcesses := [
     "WindowsTerminal.exe",
     "cmd.exe",
@@ -31,7 +29,7 @@ global TerminalProcesses := [
     "ubuntu.exe",
     "debian.exe",
     "kali.exe",
-    "Code.exe"  ; VS Code 的终端
+    "Code.exe"
 ]
 
 ; WSL 相关进程列表
@@ -47,7 +45,7 @@ global WSLProcesses := [
 if !DirExist(ImageSavePath)
     DirCreate(ImageSavePath)
 if !DirExist(WSLImageSavePath)
-    try DirCreate(WSLImageSavePath)  ; WSL 目录可能不可用，忽略错误
+    try DirCreate(WSLImageSavePath)
 
 ; 加载 GDI+
 global pToken := 0
@@ -56,13 +54,9 @@ si := Buffer(A_PtrSize = 8 ? 24 : 16, 0)
 NumPut("UInt", 1, si, 0)
 DllCall("gdiplus\GdiplusStartup", "Ptr*", &pToken, "Ptr", si, "Ptr", 0)
 
-; 注册剪贴板变化监听
-OnClipboardChange(ClipboardChanged)
-
 ; 注册 Ctrl+V 热键来拦截终端中的粘贴
 #HotIf IsTerminalActive()
 ^v::HandleTerminalPaste()
-RButton::HandleTerminalRightClick()
 #HotIf
 
 ; 退出时清理
@@ -81,7 +75,7 @@ TrayTip("剪贴板图片守护进程", "已启动，监控剪贴板中的图片.
 ; 启动时清理一次旧文件
 CleanOldImages()
 
-; 每天清理一次旧文件（24小时 = 86400000毫秒）
+; 每天清理一次旧文件
 SetTimer(CleanOldImages, 86400000)
 
 ExitFunc(*) {
@@ -96,10 +90,7 @@ CleanOldImages() {
 
     sevenDaysAgo := DateAdd(A_Now, -7, "Days")
 
-    ; 清理 Windows 目录
     CleanOldImagesInDir(ImageSavePath, sevenDaysAgo)
-
-    ; 清理 WSL 目录
     try CleanOldImagesInDir(WSLImageSavePath, sevenDaysAgo)
 }
 
@@ -114,22 +105,12 @@ CleanOldImagesInDir(dirPath, beforeDate) {
     }
 }
 
-; 主函数：处理剪贴板变化（只记录是否有图片）
-ClipboardChanged(DataType) {
-    global LastClipboardBitmap
-
-    ; DataType: 0=空, 1=文本/文件, 2=其他格式(如图片)
-    if (DataType = 2) {
-        ; 检查是否有位图格式
-        CF_BITMAP := 2
-        CF_DIB := 8
-        if DllCall("IsClipboardFormatAvailable", "UInt", CF_BITMAP)
-            || DllCall("IsClipboardFormatAvailable", "UInt", CF_DIB) {
-            LastClipboardBitmap := true
-            return
-        }
-    }
-    LastClipboardBitmap := false
+; 检测剪贴板是否有图片
+HasClipboardImage() {
+    CF_BITMAP := 2
+    CF_DIB := 8
+    return DllCall("IsClipboardFormatAvailable", "UInt", CF_BITMAP)
+        || DllCall("IsClipboardFormatAvailable", "UInt", CF_DIB)
 }
 
 ; 检测当前活动窗口是否为终端
@@ -146,18 +127,16 @@ IsTerminalActive() {
     return false
 }
 
-; 检测当前是否在 WSL 终端中（通过窗口标题判断）
+; 检测当前是否在 WSL 终端中
 IsWSLTerminal() {
     global WSLProcesses
 
     try {
         processName := WinGetProcessName("A")
-        ; 直接运行 WSL 进程
         for wslProc in WSLProcesses {
             if (processName = wslProc)
                 return true
         }
-        ; Windows Terminal 中运行 WSL（检查窗口标题，不区分大小写）
         if (processName = "WindowsTerminal.exe") {
             title := WinGetTitle("A")
             titleLower := StrLower(title)
@@ -170,23 +149,17 @@ IsWSLTerminal() {
 
 ; 处理终端中的粘贴操作
 HandleTerminalPaste() {
-    global LastClipboardBitmap, IsProcessing, LastSaveTime, ImageSavePath, WSLImageSavePath, WSLLinuxPath
+    global IsProcessing, ImageSavePath, WSLImageSavePath, WSLLinuxPath
 
     ; 如果剪贴板没有图片，执行正常粘贴
-    if !LastClipboardBitmap {
+    if !HasClipboardImage() {
         Send("^v")
         return
     }
 
-    ; 避免重入和频繁触发
+    ; 避免重入
     if IsProcessing
         return
-
-    currentTime := A_TickCount
-    if (currentTime - LastSaveTime < 500) {
-        Send("^v")
-        return
-    }
 
     IsProcessing := true
 
@@ -194,7 +167,7 @@ HandleTerminalPaste() {
         ; 检测是否在 WSL 终端中
         isWSL := IsWSLTerminal()
 
-        ; 生成文件名（使用时间戳+毫秒）
+        ; 生成文件名
         timestamp := FormatTime(, "yyyyMMdd_HHmmss")
         ms := Mod(A_TickCount, 1000)
         fileName := "clip_" . timestamp . "_" . ms . ".jpg"
@@ -202,35 +175,25 @@ HandleTerminalPaste() {
         ; 根据终端类型选择保存路径
         if isWSL {
             savePath := WSLImageSavePath . "\" . fileName
-            clipboardPath := WSLLinuxPath . "/" . fileName  ; Linux 风格路径
+            clipboardPath := WSLLinuxPath . "/" . fileName
         } else {
             savePath := ImageSavePath . "\" . fileName
             clipboardPath := savePath
         }
 
-        ; 保存图片
-        if SaveBitmapFromClipboard(savePath) {
-            LastSaveTime := A_TickCount
-            LastClipboardBitmap := false
-
-            ; 临时移除监听
-            OnClipboardChange(ClipboardChanged, 0)
-
-            ; 设置剪贴板为路径
-            A_Clipboard := ""
-            Sleep(50)
+        ; 保存剪贴板中的图片到文件
+        if SaveClipboardImageToFile(savePath) {
+            ; 临时设置剪贴板为路径
             A_Clipboard := clipboardPath
+            Sleep(50)
 
-            if ClipWait(2, 0) {
-                ; 执行粘贴
-                Send("^v")
-                TrayTip("图片已保存", fileName . (isWSL ? " (WSL)" : ""))
-            } else {
-                TrayTip("错误", "设置剪贴板失败")
-            }
+            ; 执行粘贴
+            Send("^v")
 
-            ; 延迟恢复监听
-            SetTimer(EnableClipboardMonitor, -300)
+            ; 延迟恢复剪贴板中的图片
+            SetTimer(RestoreClipboardImage.Bind(savePath), -300)
+
+            TrayTip("图片已保存", fileName . (isWSL ? " (WSL)" : ""))
         } else {
             ; 保存失败，执行正常粘贴
             Send("^v")
@@ -240,86 +203,61 @@ HandleTerminalPaste() {
     IsProcessing := false
 }
 
-; 处理终端中的右键点击（粘贴）
-HandleTerminalRightClick() {
-    global LastClipboardBitmap, IsProcessing, LastSaveTime, ImageSavePath, WSLImageSavePath, WSLLinuxPath
-
-    ; 如果剪贴板没有图片，执行正常右键
-    if !LastClipboardBitmap {
-        Click("Right")
+; 恢复剪贴板中的图片
+RestoreClipboardImage(imagePath) {
+    if !imagePath || !FileExist(imagePath)
         return
-    }
 
-    ; 避免重入和频繁触发
-    if IsProcessing {
-        Click("Right")
-        return
-    }
-
-    currentTime := A_TickCount
-    if (currentTime - LastSaveTime < 500) {
-        Click("Right")
-        return
-    }
-
-    IsProcessing := true
-
-    try {
-        ; 检测是否在 WSL 终端中
-        isWSL := IsWSLTerminal()
-
-        ; 生成文件名（使用时间戳+毫秒）
-        timestamp := FormatTime(, "yyyyMMdd_HHmmss")
-        ms := Mod(A_TickCount, 1000)
-        fileName := "clip_" . timestamp . "_" . ms . ".jpg"
-
-        ; 根据终端类型选择保存路径
-        if isWSL {
-            savePath := WSLImageSavePath . "\" . fileName
-            clipboardPath := WSLLinuxPath . "/" . fileName  ; Linux 风格路径
-        } else {
-            savePath := ImageSavePath . "\" . fileName
-            clipboardPath := savePath
-        }
-
-        ; 保存图片
-        if SaveBitmapFromClipboard(savePath) {
-            LastSaveTime := A_TickCount
-            LastClipboardBitmap := false
-
-            ; 临时移除监听
-            OnClipboardChange(ClipboardChanged, 0)
-
-            ; 设置剪贴板为路径
-            A_Clipboard := ""
-            Sleep(50)
-            A_Clipboard := clipboardPath
-
-            if ClipWait(2, 0) {
-                ; 执行右键粘贴
-                Click("Right")
-                TrayTip("图片已保存", fileName . (isWSL ? " (WSL)" : ""))
-            } else {
-                TrayTip("错误", "设置剪贴板失败")
-            }
-
-            ; 延迟恢复监听
-            SetTimer(EnableClipboardMonitor, -300)
-        } else {
-            ; 保存失败，执行正常右键
-            Click("Right")
-        }
-    }
-
-    IsProcessing := false
+    LoadImageToClipboard(imagePath)
 }
 
-EnableClipboardMonitor() {
-    OnClipboardChange(ClipboardChanged)
+; 从文件加载图片到剪贴板
+LoadImageToClipboard(filePath) {
+    global pToken
+
+    if !pToken
+        return false
+
+    ; 从文件加载图片
+    pBitmap := 0
+    status := DllCall("gdiplus\GdipCreateBitmapFromFile", "WStr", filePath, "Ptr*", &pBitmap)
+    if (status != 0 || !pBitmap)
+        return false
+
+    ; 获取 HBITMAP
+    hBitmap := 0
+    DllCall("gdiplus\GdipCreateHBITMAPFromBitmap", "Ptr", pBitmap, "Ptr*", &hBitmap, "UInt", 0xFFFFFFFF)
+    DllCall("gdiplus\GdipDisposeImage", "Ptr", pBitmap)
+
+    if !hBitmap
+        return false
+
+    ; 复制 HBITMAP（因为 SetClipboardData 会接管内存）
+    hBitmapCopy := DllCall("CopyImage", "Ptr", hBitmap, "UInt", 0, "Int", 0, "Int", 0, "UInt", 0x04, "Ptr")
+    DllCall("DeleteObject", "Ptr", hBitmap)
+
+    if !hBitmapCopy
+        return false
+
+    ; 打开剪贴板并设置位图
+    if !DllCall("OpenClipboard", "Ptr", A_ScriptHwnd) {
+        DllCall("DeleteObject", "Ptr", hBitmapCopy)
+        return false
+    }
+
+    DllCall("EmptyClipboard")
+    CF_BITMAP := 2
+    result := DllCall("SetClipboardData", "UInt", CF_BITMAP, "Ptr", hBitmapCopy)
+    DllCall("CloseClipboard")
+
+    if !result
+        DllCall("DeleteObject", "Ptr", hBitmapCopy)
+
+    return result != 0
 }
 
-; 从剪贴板保存位图为 JPG
-SaveBitmapFromClipboard(filePath) {
+; 保存剪贴板图片到文件（不修改剪贴板）
+SaveClipboardImageToFile(filePath) {
     global pToken
 
     if !pToken
@@ -333,7 +271,6 @@ SaveBitmapFromClipboard(filePath) {
     result := false
 
     try {
-        ; 优先使用 CF_BITMAP
         CF_BITMAP := 2
         hBitmap := DllCall("GetClipboardData", "UInt", CF_BITMAP, "Ptr")
 
@@ -345,7 +282,6 @@ SaveBitmapFromClipboard(filePath) {
                 , "Ptr*", &pBitmap)
 
             if (status = 0 && pBitmap) {
-                ; 获取 JPEG 编码器 CLSID
                 ; JPEG CLSID: {557CF401-1A04-11D3-9A73-0000F81EF32E}
                 CLSID := Buffer(16)
                 NumPut("UInt", 0x557CF401, CLSID, 0)
@@ -369,7 +305,6 @@ SaveBitmapFromClipboard(filePath) {
 
                 result := (status = 0)
 
-                ; 释放位图
                 DllCall("gdiplus\GdipDisposeImage", "Ptr", pBitmap)
             }
         }
